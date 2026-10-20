@@ -1,4 +1,4 @@
-# Interactive Ollama Agent
+# Nano Ollama Agent
 
 A small terminal-based coding agent that uses a local Ollama model and provides
 file tools restricted to a configurable sandbox directory.
