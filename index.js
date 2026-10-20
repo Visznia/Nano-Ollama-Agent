@@ -1,8 +1,9 @@
-import ollama from 'ollama';
+import { Ollama } from 'ollama';
 import fs from 'fs/promises';
 import path from 'path';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
+import { Agent, fetch as undiciFetch } from 'undici';
 
 const PROJECT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(PROJECT_DIR, 'config.json');
@@ -15,13 +16,30 @@ if (typeof config.model !== 'string' || !config.model.trim()) {
 if (!Number.isInteger(config.context_window) || config.context_window <= 0) {
   throw new Error(`Invalid "context_window" in ${CONFIG_PATH}: expected a positive integer.`);
 }
+if (
+  config.stream_idle_timeout_ms !== undefined
+  && (!Number.isInteger(config.stream_idle_timeout_ms) || config.stream_idle_timeout_ms <= 0)
+) {
+  throw new Error(`Invalid "stream_idle_timeout_ms" in ${CONFIG_PATH}: expected a positive integer.`);
+}
 if (typeof config.sandbox_dir !== 'string' || !config.sandbox_dir.trim()) {
   throw new Error(`Invalid "sandbox_dir" in ${CONFIG_PATH}: expected a non-empty path.`);
 }
 
 const MODEL = config.model;
 const CONTEXT_WINDOW = config.context_window;
+const STREAM_IDLE_TIMEOUT_MS = config.stream_idle_timeout_ms ?? 1800000;
 const SANDBOX_DIR = path.resolve(PROJECT_DIR, config.sandbox_dir);
+const ollamaDispatcher = new Agent({
+  bodyTimeout: STREAM_IDLE_TIMEOUT_MS,
+  headersTimeout: STREAM_IDLE_TIMEOUT_MS,
+});
+const ollama = new Ollama({
+  fetch: (input, options = {}) => undiciFetch(input, {
+    ...options,
+    dispatcher: ollamaDispatcher,
+  }),
+});
 await fs.mkdir(SANDBOX_DIR, { recursive: true });
 
 const rl = readline.createInterface({
@@ -217,64 +235,111 @@ function printUsage(stats) {
 }
 
 async function streamChat(msgs) {
-  const stream = await ollama.chat({
-    model: MODEL,
-    messages: msgs,
-    tools,
-    stream: true,
-    options: {
-      num_ctx: CONTEXT_WINDOW,
-      temperature: 0.1,
-    },
-  });
-
   let fullContent = '';
   let fullThinking = '';
   const toolCalls = [];
   let hasThinkingHeader = false;
   let hasResponseHeader = false;
   let stats = {};
+  let phase = 'waiting for Ollama';
+  let chunkCount = 0;
+  let thinkingCharacters = 0;
+  let responseCharacters = 0;
+  let lastChunkAt = Date.now();
+  let lastProgressAt = lastChunkAt;
+  let needsContinuationHeader = false;
+  const requestStartedAt = lastChunkAt;
 
   console.log(`\n${colors.cyan}${colors.bold}  Agent${colors.reset}`);
 
-  for await (const chunk of stream) {
-    const thinking = chunk.message?.thinking;
-    if (thinking) {
-      if (!hasThinkingHeader) {
-        process.stdout.write(`  ${colors.dim}Thinking:${colors.reset} `);
-        hasThinkingHeader = true;
+  const progressTimer = setInterval(() => {
+    const now = Date.now();
+    if (now - lastChunkAt < 10000 || now - lastProgressAt < 10000) return;
+
+    const details = [
+      `still working: ${phase}`,
+      `${formatDuration((now - requestStartedAt) * 1e6)} elapsed`,
+      `${formatDuration((now - lastChunkAt) * 1e6)} since last update`,
+      `${chunkCount} chunks`,
+      `${formatNumber(thinkingCharacters)} thinking chars`,
+      `${formatNumber(responseCharacters)} response chars`,
+      `${toolCalls.length} tool calls`,
+    ];
+
+    process.stdout.write(`\n${colors.dim}  [${details.join(' | ')}]${colors.reset}\n`);
+    lastProgressAt = now;
+    needsContinuationHeader = hasThinkingHeader || hasResponseHeader;
+  }, 1000);
+
+  try {
+    const stream = await ollama.chat({
+      model: MODEL,
+      messages: msgs,
+      tools,
+      stream: true,
+      options: {
+        num_ctx: CONTEXT_WINDOW,
+        temperature: 0.1,
       }
-      process.stdout.write(thinking);
-      fullThinking += thinking;
-    }
+    });
 
-    const content = chunk.message?.content;
-    if (content) {
-      if (!hasResponseHeader) {
-        if (hasThinkingHeader) process.stdout.write('\n');
-        process.stdout.write(`  ${colors.green}Response:${colors.reset} `);
-        hasResponseHeader = true;
+    for await (const chunk of stream) {
+      chunkCount += 1;
+      lastChunkAt = Date.now();
+
+      const thinking = chunk.message?.thinking;
+      if (thinking) {
+        phase = 'model is thinking';
+        if (needsContinuationHeader) {
+          process.stdout.write(`  ${colors.dim}Thinking (continued):${colors.reset} `);
+          needsContinuationHeader = false;
+          hasThinkingHeader = true;
+        } else if (!hasThinkingHeader) {
+          process.stdout.write(`  ${colors.dim}Thinking:${colors.reset} `);
+          hasThinkingHeader = true;
+        }
+        process.stdout.write(thinking);
+        fullThinking += thinking;
+        thinkingCharacters += thinking.length;
       }
-      process.stdout.write(content);
-      fullContent += content;
-    }
 
-    if (chunk.message?.tool_calls) {
-      toolCalls.push(...chunk.message.tool_calls);
-    }
+      const content = chunk.message?.content;
+      if (content) {
+        phase = 'model is writing its response';
+        if (needsContinuationHeader) {
+          process.stdout.write(`  ${colors.green}Response (continued):${colors.reset} `);
+          needsContinuationHeader = false;
+          hasResponseHeader = true;
+        } else if (!hasResponseHeader) {
+          if (hasThinkingHeader) process.stdout.write('\n');
+          process.stdout.write(`  ${colors.green}Response:${colors.reset} `);
+          hasResponseHeader = true;
+        }
+        process.stdout.write(content);
+        fullContent += content;
+        responseCharacters += content.length;
+      }
 
-    if (chunk.done) {
-      stats = {
-        model: chunk.model,
-        total_duration: chunk.total_duration,
-        load_duration: chunk.load_duration,
-        prompt_eval_count: chunk.prompt_eval_count,
-        prompt_eval_duration: chunk.prompt_eval_duration,
-        eval_count: chunk.eval_count,
-        eval_duration: chunk.eval_duration,
-        done_reason: chunk.done_reason,
-      };
+      if (chunk.message?.tool_calls) {
+        phase = 'model is preparing tool calls';
+        toolCalls.push(...chunk.message.tool_calls);
+      }
+
+      if (chunk.done) {
+        stats = {
+          model: chunk.model,
+          total_duration: chunk.total_duration,
+          load_duration: chunk.load_duration,
+          prompt_eval_count: chunk.prompt_eval_count,
+          prompt_eval_duration: chunk.prompt_eval_duration,
+          eval_count: chunk.eval_count,
+          eval_duration: chunk.eval_duration,
+          done_reason: chunk.done_reason,
+        };
+      }
     }
+  } finally {
+    clearInterval(progressTimer);
   }
 
   if (hasThinkingHeader || hasResponseHeader) process.stdout.write('\n');
@@ -305,6 +370,7 @@ function showStatus(lastPromptTokens) {
   console.log(`\n${colors.cyan}${colors.bold}  Agent status${colors.reset}`);
   console.log(`  Model: ${MODEL}`);
   console.log(`  Configured context window: ${formatNumber(CONTEXT_WINDOW)} tokens`);
+  console.log(`  Stream idle timeout: ${formatDuration(STREAM_IDLE_TIMEOUT_MS * 1e6)}`);
   console.log(`  Last reported prompt usage: ${Number.isFinite(lastPromptTokens) ? `${formatNumber(lastPromptTokens)} tokens (${((lastPromptTokens / CONTEXT_WINDOW) * 100).toFixed(1)}%)` : 'not available yet'}`);
   console.log(`  Conversation messages: ${messages.length}`);
   console.log(`  Sandbox: ${SANDBOX_DIR}\n`);
@@ -314,7 +380,7 @@ async function runAgentLoop() {
   let lastPromptTokens;
   const input = rl[Symbol.asyncIterator]();
 
-  console.log(`${colors.cyan}${colors.bold}Interactive Ollama Agent${colors.reset}`);
+  console.log(`${colors.cyan}${colors.bold}Nano Ollama Agent${colors.reset}`);
   console.log(`  Model: ${MODEL}  |  Context: ${formatNumber(CONTEXT_WINDOW)} tokens`);
   console.log(`  Config: ${CONFIG_PATH}`);
   console.log(`  Sandbox: ${SANDBOX_DIR}`);
@@ -406,7 +472,7 @@ async function runAgentLoop() {
     } catch (error) {
       console.error(`\n${colors.red}${colors.bold}Agent request failed${colors.reset}`);
       console.error(formatError(error));
-      console.error(`${colors.dim}Check that Ollama is running, the model "${MODEL}" is available, and the connection is configured correctly.${colors.reset}\n`);
+      console.error(`${colors.dim}Check that Ollama is running and the model "${MODEL}" is available. If this was a BodyTimeoutError during generation, increase "stream_idle_timeout_ms" in config.json.${colors.reset}\n`);
     }
 
     console.log(`${colors.dim}Turn completed in ${((Date.now() - turnStartedAt) / 1000).toFixed(1)} s. Conversation: ${messages.length} messages.${colors.reset}\n`);

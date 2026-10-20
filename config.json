@@ -1,5 +1,6 @@
 {
-  "model": "qwen3.5:2b",
+  "model": "qwen3.5:0.8b",
   "context_window": 32768,
+  "stream_idle_timeout_ms": 1800000,
   "sandbox_dir": "./sandbox"
 }

@@ -1,4 +1,4 @@
-# Interactive Ollama Agent
+# Nano Ollama Agent
 
 A small terminal-based coding agent that uses a local Ollama model and provides
 file tools restricted to a configurable sandbox directory.
@@ -40,6 +40,7 @@ Edit `config.json`:
 {
   "model": "qwen3.5:2b",
   "context_window": 32768,
+  "stream_idle_timeout_ms": 1800000,
   "sandbox_dir": "./sandbox"
 }
 ```
@@ -47,6 +48,10 @@ Edit `config.json`:
 - `model`: Ollama model name. The model must be available locally; use
   `ollama list` to see downloaded models.
 - `context_window`: context size requested for each model call, in tokens.
+- `stream_idle_timeout_ms`: maximum time in milliseconds Ollama can go without
+  sending response data. The default is 30 minutes, which allows slower models
+  more time to think or generate. Increase it if requests still fail with a
+  `BodyTimeoutError`.
 - `sandbox_dir`: directory where the agent's file tools can read and write.
   Relative paths are resolved from this project directory. Absolute paths are
   also accepted.
@@ -68,5 +73,8 @@ Absolute paths and paths that escape the sandbox are rejected.
 
 Terminal output includes the model's thinking and response, tool calls and
 results, errors, token counts, configured context usage, and timing statistics.
-Use `/help` to see the interactive commands (`/status`, `/clear`, and `/exit`
-are also available).
+If Ollama pauses while thinking or generating, the agent periodically reports
+the elapsed time, time since the last stream update, received chunk count, and
+thinking/response character counts. Character counts are progress indicators,
+not token counts. Use `/help` to see the interactive commands (`/status`,
+`/clear`, and `/exit` are also available).
