@@ -1,0 +1,5 @@
+{
+  "model": "qwen3.5:2b",
+  "context_window": 32768,
+  "sandbox_dir": "./sandbox"
+}
